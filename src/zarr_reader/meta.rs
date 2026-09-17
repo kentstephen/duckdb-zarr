@@ -88,7 +88,7 @@ impl StoreFormat {
 /// filter, and zarrs 0.23's `fletcher32` codec miscomputes the checksum for
 /// payloads with an odd byte length (the odd trailing byte is never folded
 /// in), so roughly half of all deflated HDF5 chunks fail validation with a
-/// correct checksum on disk. Until that is fixed upstream, checksum
+/// correct checksum on disk (zarrs/zarrs#460). Until that is fixed upstream, checksum
 /// validation is skipped for manifest reads; the checksum bytes are still
 /// stripped and the data decodes correctly. Real Zarr stores keep validation
 /// (crc32c in sharded v3 stores, in particular).
