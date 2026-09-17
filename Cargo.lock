@@ -3208,6 +3208,7 @@ dependencies = [
  "ndarray",
  "openssl",
  "rayon",
+ "serde",
  "serde_json",
  "zarrs",
  "zarrs_http",

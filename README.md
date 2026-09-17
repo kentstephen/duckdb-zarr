@@ -53,6 +53,33 @@ datasets already do (e.g. anything written by xarray with `consolidated=True`), 
 they read straight from their URL as shown above. S3/GCS/Azure credentials come from
 DuckDB's secrets manager (`CREATE SECRET ... TYPE S3`).
 
+## Virtual Zarr (kerchunk manifests)
+
+A [kerchunk](https://fsspec.github.io/kerchunk/spec.html) JSON manifest describes a
+Zarr store whose chunks are byte ranges inside other files: NetCDF4/HDF5, GRIB,
+GeoTIFF, or another Zarr. Tools such as [VirtualiZarr](https://virtualizarr.readthedocs.io/)
+produce them without copying any data. Pass `format='kerchunk'` to read one:
+
+```sql
+SELECT * FROM read_zarr('refs.json', format='kerchunk');
+SELECT * FROM read_zarr('s3://bucket/index/refs.json', format='kerchunk', dims=['time','lat','lon']);
+SELECT * FROM read_zarr_metadata('refs.json', format='kerchunk');
+```
+
+The manifest and every file it references are read through DuckDB's filesystem, so
+local paths, HTTP(S), S3, GCS and Azure all work and the secrets manager applies.
+Metadata and inline chunks are served from the manifest; each chunk key becomes one
+range read of the referenced file, and open file handles are reused across chunks.
+Both manifest versions are accepted (`refs` with `templates`; `gen` is not supported).
+Kerchunk Parquet manifests and Icechunk virtual references are not supported yet.
+
+The HDF5 filter pipeline written by VirtualiZarr's HDF parser (shuffle, zlib,
+fletcher32) decodes natively, as do Deflate and ZSTD GeoTIFF tiles indexed by
+[virtual-tiff](https://github.com/virtual-zarr/virtual-tiff) (its `imagecodecs_*`
+codec ids are aliased to the numcodecs ones). GeoTIFFs written with a predictor,
+and LZW, JPEG or WebP tiles, need codecs zarrs does not have yet. Checksums are
+not validated on manifest reads for now (see `meta::codec_options`).
+
 ## Status
 
 Active development. Phases 1–3 are implemented:
@@ -60,6 +87,7 @@ Active development. Phases 1–3 are implemented:
 - **Phase 1** — `read_zarr`, `read_zarr_metadata`, `read_zarr_groups` table functions; Zarr v3; CF conventions (fill values, scale/offset, time → `TIMESTAMP`, bounds variables, aux coords)
 - **Phase 2** — Zarr v2, Blosc/LZ4, replacement scan for local `.zarr` paths, projection pushdown
 - **Phase 3** — HTTP/HTTPS stores, `dims=` and `array_path=` selection, recursive array discovery
+- **Virtual Zarr** — kerchunk JSON manifests via `format='kerchunk'`
 
 See the [phased plan](docs/design.md#phased-plan) for what's next.
 

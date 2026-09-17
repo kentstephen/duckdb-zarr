@@ -24,6 +24,7 @@ base64 when it encounters a string value; for NaN sentinels use is_nan().
 """
 import contextlib
 import os
+import json
 import pathlib
 import shutil
 import subprocess
@@ -109,6 +110,41 @@ def open_tutorial(name: str, **kwargs) -> xr.Dataset:
                   f"retry {attempt + 1}/5 in {wait}s")
             time.sleep(wait)
     raise last_exc
+
+
+def rewrite_manifest_paths(refs_path: pathlib.Path, old: str, new: str) -> None:
+    """Rewrite every chunk reference path `old` (or file://old) to `new`."""
+    doc = json.loads(refs_path.read_text())
+    refs = doc.get("refs", doc)
+    for key, value in refs.items():
+        if isinstance(value, list) and value and isinstance(value[0], str):
+            path = value[0]
+            if path.startswith("file://"):
+                path = path[len("file://"):]
+            if path == old:
+                refs[key] = [new, *value[1:]]
+    refs_path.write_text(json.dumps(doc))
+
+
+def write_manifest_over_zarr_v2(store: pathlib.Path, refs_path: pathlib.Path,
+                                skip_keys: set[str]) -> None:
+    """Build a kerchunk manifest by hand from an unconsolidated Zarr v2 directory.
+
+    Metadata documents are inlined; chunk files become whole-file references
+    relative to the repo root. Keys in `skip_keys` are omitted from the manifest.
+    """
+    refs: dict[str, object] = {}
+    for path in sorted(store.rglob("*")):
+        if not path.is_file():
+            continue
+        key = path.relative_to(store).as_posix()
+        if key in skip_keys:
+            continue
+        if path.name in (".zarray", ".zattrs", ".zgroup"):
+            refs[key] = path.read_text()
+        else:
+            refs[key] = [path.relative_to(ROOT).as_posix()]
+    refs_path.write_text(json.dumps({"version": 1, "refs": refs}))
 
 
 def main() -> None:
@@ -650,6 +686,179 @@ def main() -> None:
         http_ds.to_zarr(dest, zarr_format=3, consolidated=False)
         zarr.consolidate_metadata(str(dest))
         print(f"  wrote {dest}")
+
+    # ── kerchunk_netcdf4 ─────────────────────────────────────────────────────
+    # Virtual Zarr: a NetCDF4 file using the HDF5 filter pipeline (shuffle +
+    # deflate + fletcher32) indexed by VirtualiZarr into a kerchunk JSON manifest.
+    # The same dataset is also written as a real Zarr v2 store so the SQL tests
+    # can assert that read_zarr(manifest, format='kerchunk') and read_zarr(zarr)
+    # return identical rows. Manifest paths are rewritten to be relative to the
+    # repo root, which is where the SQL test runner resolves fixture paths.
+    from virtualizarr import open_virtual_dataset
+    from virtualizarr.parsers import HDFParser
+    try:
+        from obspec_utils.registry import ObjectStoreRegistry
+    except ImportError:  # virtualizarr < 2.8
+        from virtualizarr.registry import ObjectStoreRegistry
+    from obstore.store import LocalStore
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+
+    print("kerchunk_netcdf4 (NetCDF4 + VirtualiZarr manifest + Zarr v2 twin)...")
+    nc_path = FIXTURES / "kerchunk_netcdf4.nc"
+    refs_path = FIXTURES / "kerchunk_netcdf4.json"
+    twin_path = FIXTURES / "kerchunk_netcdf4_v2.zarr"
+    if refs_path.exists() and (twin_path / ".zgroup").exists():
+        print(f"  (cached) {refs_path}")
+    else:
+        for stale in (nc_path, refs_path):
+            if stale.exists():
+                stale.unlink()
+        if twin_path.exists():
+            _rmtree(twin_path)
+        rng = np.random.default_rng(7)
+        temp = rng.standard_normal((8, 6, 12)).astype("float32") * 10 + 280
+        temp[0, 0, 0] = np.nan          # masked via _FillValue in both stores
+        temp[5, 3, :] = np.nan
+        pres = (rng.standard_normal((8, 6, 12)) * 5 + 1013).astype("float32")
+        mask = (rng.random((6, 12)) > 0.5).astype("int16")
+        kc_ds = xr.Dataset(
+            {
+                "temperature": (("time", "lat", "lon"), temp,
+                                {"units": "K", "long_name": "temperature"}),
+                "pressure": (("time", "lat", "lon"), pres, {"units": "hPa"}),
+                "mask": (("lat", "lon"), mask),
+            },
+            coords={
+                "time": np.arange(8, dtype="int64"),
+                "lat": np.linspace(-90.0, 90.0, 6),
+                "lon": np.linspace(0.0, 360.0, 12, endpoint=False),
+            },
+        )
+        nc_enc = {
+            # Full HDF5 pipeline; two chunks along time.
+            "temperature": {"zlib": True, "shuffle": True, "complevel": 1,
+                            "fletcher32": True, "chunksizes": (4, 6, 12),
+                            "_FillValue": np.float32(-9999.0)},
+            # Deflate only, no shuffle or checksum. Same chunk shape as
+            # temperature: read_zarr requires it within one dim group.
+            "pressure": {"zlib": True, "shuffle": False, "complevel": 4,
+                         "chunksizes": (4, 6, 12)},
+            # Contiguous, no filters: a single whole-dataset reference.
+            "mask": {},
+        }
+        kc_ds.to_netcdf(nc_path, engine="h5netcdf", encoding=nc_enc)
+
+        vds = open_virtual_dataset(f"file://{nc_path.resolve()}",
+                                   parser=HDFParser(), registry=registry)
+        vds.vz.to_kerchunk(str(refs_path), format="json")
+        rewrite_manifest_paths(refs_path, str(nc_path.resolve()),
+                               nc_path.relative_to(ROOT).as_posix())
+
+        v2_enc = {
+            "temperature": {"compressor": {"id": "gzip", "level": 1},
+                            "chunks": (4, 6, 12), "_FillValue": np.float32(-9999.0)},
+            "pressure": {"compressor": {"id": "gzip", "level": 1}, "chunks": (4, 6, 12)},
+            "mask": {"compressor": None},
+            "lat": {"compressor": None}, "lon": {"compressor": None},
+            "time": {"compressor": None},
+        }
+        kc_ds.to_zarr(twin_path, zarr_format=2, consolidated=True, encoding=v2_enc)
+        print(f"  wrote {refs_path}")
+
+    # ── kerchunk_zarr_v2 ─────────────────────────────────────────────────────
+    # A manifest whose chunk references point at the chunk files of a real Zarr
+    # v2 store, using the whole-file `[path]` reference form. One chunk is
+    # deliberately left out of the manifest: an absent key must decode to the
+    # array's fill value (NULL after masking), which is how kerchunk represents
+    # HDF5 chunks that were never written.
+    print("kerchunk_zarr_v2 (manifest over Zarr v2 chunk files, one chunk missing)...")
+    src_path = FIXTURES / "kerchunk_zarr_v2_source.zarr"
+    refs_path = FIXTURES / "kerchunk_zarr_v2.json"
+    if refs_path.exists() and (src_path / ".zgroup").exists():
+        print(f"  (cached) {refs_path}")
+    else:
+        if refs_path.exists():
+            refs_path.unlink()
+        if src_path.exists():
+            _rmtree(src_path)
+        rng = np.random.default_rng(11)
+        data = rng.standard_normal((8, 6, 12)).astype("float32")
+        src_ds = xr.Dataset(
+            {"temperature": (("time", "lat", "lon"), data, {"units": "K"})},
+            coords={"time": np.arange(8, dtype="int64"),
+                    "lat": np.linspace(-90.0, 90.0, 6),
+                    "lon": np.linspace(0.0, 360.0, 12, endpoint=False)},
+        )
+        src_ds.to_zarr(src_path, zarr_format=2, consolidated=False, encoding={
+            "temperature": {"compressor": {"id": "gzip", "level": 1},
+                            "chunks": (4, 6, 12)},
+            "lat": {"compressor": None}, "lon": {"compressor": None},
+            "time": {"compressor": None},
+        })
+        write_manifest_over_zarr_v2(src_path, refs_path, skip_keys={"temperature/1.0.0"})
+        print(f"  wrote {refs_path}")
+
+    # ── kerchunk_cog_* ───────────────────────────────────────────────────────
+    # Cloud-optimised GeoTIFFs indexed by virtual-tiff. Tiled TIFF tiles are
+    # Zarr chunks by construction: each tile is one [path, offset, length]
+    # reference. Two variants: a single-band float32 Deflate image with a
+    # nodata value (virtual-tiff writes numcodecs `zlib`), and a 3-band int8
+    # ZSTD image stored band-interleaved (virtual-tiff writes
+    # `imagecodecs_zstd`, which the reader aliases to `zstd`). Each has a Zarr
+    # v2 twin holding the same array.
+    print("kerchunk_cog_deflate / kerchunk_cog_zstd (tiled TIFF + virtual-tiff manifest)...")
+    import tifffile
+    from virtual_tiff import VirtualTIFF
+
+    rng = np.random.default_rng(3)
+    cog_f32 = (rng.standard_normal((300, 500)) * 10 + 280).astype("float32")
+    cog_f32[10:20, :] = -9999.0
+    cog_i8 = rng.integers(-100, 100, (3, 200, 400), dtype="int8")
+    cogs = {
+        "kerchunk_cog_deflate": dict(
+            data=cog_f32, dims=("y", "x"), tile=(256, 256), compression="deflate",
+            planar=None, nodata="-9999",
+            v2_enc={"compressor": {"id": "gzip", "level": 1}, "chunks": (256, 256),
+                    "_FillValue": np.float32(-9999.0)},
+        ),
+        "kerchunk_cog_zstd": dict(
+            data=cog_i8, dims=("band", "y", "x"), tile=(128, 128), compression="zstd",
+            planar="separate", nodata=None,
+            v2_enc={"compressor": {"id": "gzip", "level": 1}, "chunks": (1, 128, 128)},
+        ),
+    }
+    for name, spec in cogs.items():
+        tif_path = FIXTURES / f"{name}.tif"
+        refs_path = FIXTURES / f"{name}.json"
+        twin_path = FIXTURES / f"{name}_v2.zarr"
+        if refs_path.exists() and (twin_path / ".zgroup").exists():
+            print(f"  (cached) {refs_path}")
+            continue
+        for stale in (tif_path, refs_path):
+            if stale.exists():
+                stale.unlink()
+        if twin_path.exists():
+            _rmtree(twin_path)
+        extratags = []
+        if spec["nodata"] is not None:
+            # GDAL_NODATA tag (42113): virtual-tiff turns it into the fill value.
+            extratags.append((42113, "s", 0, spec["nodata"], True))
+        kwargs = dict(tile=spec["tile"], compression=spec["compression"], metadata=None,
+                      extratags=extratags)
+        if spec["planar"]:
+            kwargs["planarconfig"] = spec["planar"]
+        tifffile.imwrite(tif_path, spec["data"], **kwargs)
+
+        vds = open_virtual_dataset(f"file://{tif_path.resolve()}",
+                                   parser=VirtualTIFF(ifd=0), registry=registry)
+        vds.vz.to_kerchunk(str(refs_path), format="json")
+        rewrite_manifest_paths(refs_path, str(tif_path.resolve()),
+                               tif_path.relative_to(ROOT).as_posix())
+
+        twin = xr.Dataset({"0": (spec["dims"], spec["data"])})
+        twin.to_zarr(twin_path, zarr_format=2, consolidated=True,
+                     encoding={"0": spec["v2_enc"]})
+        print(f"  wrote {refs_path}")
 
     print("\nAll fixtures written.")
 
