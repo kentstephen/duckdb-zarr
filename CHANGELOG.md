@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **WebAssembly build** (`make wasm_mvp`): the extension compiles for `wasm32-unknown-emscripten` and loads in duckdb-wasm. `zarrs_http` (reqwest) is gated off wasm and every store is routed through `DuckDbStore`, so duckdb-wasm's HTTP filesystem does the fetching; rayon's global pool is built with the current thread as its only worker at extension init; C dependencies built by cc-rs (zstd-sys) get `-fPIC` for the wasm triple only. Native builds are unchanged. The wasm platforms remain in `excluded_platforms`.
+
+### Fixed
+- `DuckDbStore::get_partial_many` loops on short reads instead of failing. DuckDB file systems may return fewer bytes than requested (duckdb-wasm's HTTP filesystem returns 16 KiB pieces).
+
 ## [0.1.3] - 2026-08-04
 
 ### Changed
