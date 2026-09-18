@@ -195,3 +195,39 @@ statement error
 SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_netcdf4.nc', format='kerchunk');
 ----
 kerchunk manifest is not JSON
+
+# ── broken chunk references ──────────────────────────────────────────────────
+# kerchunk_errors/*.json are kerchunk_zarr_v2.json with temperature/0.0.0
+# rewritten to a bad reference. Each fails the query with an error that names
+# the file (and, for a decode failure, the array and chunk), never a panic or
+# silent fill values. The unit tests in manifest_store.rs cover the same paths
+# with an in-memory filesystem; these run them through DuckDB's real one.
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_errors/missing_file.json', format='kerchunk');
+----
+could not open referenced file 'test/fixtures/xarray_tutorial/kerchunk_errors/does_not_exist.bin'
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_errors/past_end.json', format='kerchunk');
+----
+kerchunk_zarr_v2_source.zarr/temperature/0.0.0': read of 2135 bytes at offset 0 hit end of file after 1135 bytes
+
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_errors/offset_beyond_end.json', format='kerchunk');
+----
+read of 4 bytes at offset 1136 hit end of file after 0 bytes
+
+# A reference shorter than the compressed chunk: the decoder fails, and the
+# error says which chunk.
+statement error
+SELECT * FROM read_zarr('test/fixtures/xarray_tutorial/kerchunk_errors/truncated.json', format='kerchunk');
+----
+reading chunk [0, 0, 0] of array 'temperature'
+
+# The metadata functions never touch chunk bytes, so a broken chunk reference
+# does not affect them.
+query I
+SELECT COUNT(*) FROM read_zarr_metadata('test/fixtures/xarray_tutorial/kerchunk_errors/missing_file.json', format='kerchunk');
+----
+4

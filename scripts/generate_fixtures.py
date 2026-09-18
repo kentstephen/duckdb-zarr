@@ -798,6 +798,34 @@ def main() -> None:
         write_manifest_over_zarr_v2(src_path, refs_path, skip_keys={"temperature/1.0.0"})
         print(f"  wrote {refs_path}")
 
+    # ── kerchunk_errors ──────────────────────────────────────────────────────
+    # Variants of kerchunk_zarr_v2.json whose `temperature/0.0.0` reference is
+    # broken in a different way each. The SQL suite checks the reader reports
+    # each with an error that names the file, not a panic or a silent fill.
+    # Cheap and derived, so they are rebuilt every run.
+    print("kerchunk_errors (manifests with a broken chunk reference)...")
+    errors_dir = FIXTURES / "kerchunk_errors"
+    errors_dir.mkdir(exist_ok=True)
+    base = json.loads(refs_path.read_text())
+    chunk_key = "temperature/0.0.0"
+    chunk_rel = base["refs"][chunk_key][0]
+    chunk_size = (ROOT / chunk_rel).stat().st_size
+    variants = {
+        # The referenced file does not exist.
+        "missing_file": [f"{errors_dir.relative_to(ROOT).as_posix()}/does_not_exist.bin"],
+        # The range runs past the end of the file.
+        "past_end": [chunk_rel, 0, chunk_size + 1000],
+        # The range stops short of the chunk: a truncated gzip stream.
+        "truncated": [chunk_rel, 0, 10],
+        # The offset lies beyond the end of the file.
+        "offset_beyond_end": [chunk_rel, chunk_size + 1, 4],
+    }
+    for name, ref in variants.items():
+        doc = {"version": 1, "refs": dict(base["refs"])}
+        doc["refs"][chunk_key] = ref
+        (errors_dir / f"{name}.json").write_text(json.dumps(doc))
+    print(f"  wrote {errors_dir}")
+
     # ── kerchunk_cog_* ───────────────────────────────────────────────────────
     # Cloud-optimised GeoTIFFs indexed by virtual-tiff. Tiled TIFF tiles are
     # Zarr chunks by construction: each tile is one [path, offset, length]

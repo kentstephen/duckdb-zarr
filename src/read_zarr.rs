@@ -388,10 +388,17 @@ fn decode_work_unit(
             .ok_or_else(|| format!("array '{}' not found in bind cache", col.name))?;
         // ArrayBytes<'static>: zarrs convention for requesting owned decoded bytes.
         // retrieve_chunk fills missing (implicit) chunks with fill_value automatically.
-        let raw = arr.retrieve_chunk_opt::<zarrs::array::ArrayBytes<'static>>(
-            &wu.chunk_indices,
-            &bind.codec_options,
-        )?;
+        let raw = arr
+            .retrieve_chunk_opt::<zarrs::array::ArrayBytes<'static>>(
+                &wu.chunk_indices,
+                &bind.codec_options,
+            )
+            .map_err(|e| {
+                format!(
+                    "reading chunk {:?} of array '{}': {e}",
+                    wu.chunk_indices, col.name
+                )
+            })?;
         let bytes: Vec<u8> = raw
             .into_fixed()
             .map_err(|_| format!("variable-length dtype not supported for '{}'", col.name))?

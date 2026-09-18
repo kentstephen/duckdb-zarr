@@ -450,15 +450,77 @@ fn normalise_path(path: &str) -> String {
     }
 }
 
+/// One open source file. The store needs three things from it: its size,
+/// positioning, and a `read` that may return fewer bytes than asked for.
+/// The DuckDB file handle implements this over FFI; tests implement it over
+/// a byte vector so the read loop, pooling and error paths run without a
+/// database.
+pub trait SourceFile: Send {
+    fn size(&mut self) -> u64;
+    /// Position the next read at `offset`. `false` means the seek failed.
+    fn seek(&mut self, offset: u64) -> bool;
+    /// Read up to `buf.len()` bytes. Mirrors the C API: negative is an
+    /// error, zero is end of file, positive is the number of bytes read.
+    fn read(&mut self, buf: &mut [u8]) -> i64;
+}
+
+/// Opens the files a manifest references.
+pub trait SourceOpener: Send + Sync {
+    /// `Ok(None)` when the file cannot be opened.
+    fn open(&self, path: &str) -> Result<Option<Box<dyn SourceFile>>, StorageError>;
+}
+
+/// Read exactly `length` bytes at `offset`. DuckDB's HTTP filesystem may
+/// return fewer bytes per call than requested, so loop until done, and turn
+/// a short file or a failed call into an error naming the offset and count.
+fn read_exact_at(
+    file: &mut dyn SourceFile,
+    offset: u64,
+    length: u64,
+) -> Result<Bytes, StorageError> {
+    if !file.seek(offset) {
+        return Err(StorageError::Other(format!(
+            "seek to offset {offset} failed"
+        )));
+    }
+    let mut buf = vec![0u8; length as usize];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..]);
+        if n < 0 {
+            return Err(StorageError::Other(format!(
+                "read of {length} bytes at offset {offset} failed"
+            )));
+        }
+        if n == 0 {
+            return Err(StorageError::Other(format!(
+                "read of {length} bytes at offset {offset} hit end of file after {filled} bytes"
+            )));
+        }
+        filled += n as usize;
+    }
+    Ok(Bytes::from(buf))
+}
+
+/// Read an entire file: the manifest document itself, which may live
+/// anywhere the opener can reach.
+fn read_whole(opener: &dyn SourceOpener, path: &str) -> Result<Bytes, StorageError> {
+    let mut file = opener
+        .open(path)?
+        .ok_or_else(|| StorageError::Other(format!("could not open '{path}'")))?;
+    let size = file.size();
+    read_exact_at(file.as_mut(), 0, size)
+}
+
 /// An open DuckDB file handle that closes itself on drop.
-struct Handle(duckdb_file_handle);
+struct DuckDbFile(duckdb_file_handle);
 
 // SAFETY: a handle is only ever used by one thread at a time (it is checked
 // out of the pool under a mutex and returned after use), and DuckDB file
 // handles are not bound to the thread that opened them.
-unsafe impl Send for Handle {}
+unsafe impl Send for DuckDbFile {}
 
-impl Drop for Handle {
+impl Drop for DuckDbFile {
     fn drop(&mut self) {
         unsafe {
             duckdb_file_handle_close(self.0);
@@ -467,109 +529,81 @@ impl Drop for Handle {
     }
 }
 
-impl Handle {
-    fn size(&self) -> u64 {
-        unsafe { duckdb_file_handle_size(self.0) as u64 }
+impl SourceFile for DuckDbFile {
+    fn size(&mut self) -> u64 {
+        unsafe { duckdb_file_handle_size(self.0) }.max(0) as u64
     }
 
-    /// Read exactly `length` bytes at `offset`. DuckDB's HTTP filesystem may
-    /// return fewer bytes per call than requested, so loop until done.
-    fn read_exact_at(&self, offset: u64, length: u64) -> Result<Bytes, StorageError> {
-        let state = unsafe { duckdb_file_handle_seek(self.0, offset as i64) };
-        if state != DuckDBSuccess {
-            return Err(StorageError::Other(format!(
-                "seek to offset {offset} failed"
-            )));
-        }
-        let mut buf = vec![0u8; length as usize];
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            let remaining = (buf.len() - filled) as i64;
-            let n = unsafe {
-                duckdb_file_handle_read(self.0, buf.as_mut_ptr().add(filled).cast(), remaining)
-            };
-            if n < 0 {
-                return Err(StorageError::Other(format!(
-                    "read of {length} bytes at offset {offset} failed"
-                )));
-            }
-            if n == 0 {
-                return Err(StorageError::Other(format!(
-                    "read of {length} bytes at offset {offset} hit end of file after {filled} bytes"
-                )));
-            }
-            filled += n as usize;
-        }
-        Ok(Bytes::from(buf))
+    fn seek(&mut self, offset: u64) -> bool {
+        unsafe { duckdb_file_handle_seek(self.0, offset as i64) == DuckDBSuccess }
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> i64 {
+        unsafe { duckdb_file_handle_read(self.0, buf.as_mut_ptr().cast(), buf.len() as i64) }
     }
 }
 
-/// Read an entire file through DuckDB's filesystem. Used for the manifest
-/// document itself, which may live anywhere DuckDB can read.
-///
-/// # Safety
-/// `file_system` must be a live handle obtained from a DuckDB client context.
-pub unsafe fn read_whole_file(
+/// Opens files through DuckDB's FileSystem API. Owns the filesystem handle
+/// and destroys it on drop.
+pub struct DuckDbOpener {
     file_system: duckdb_file_system,
-    path: &str,
-) -> Result<Bytes, StorageError> {
-    let handle = open_read(file_system, path)?
-        .ok_or_else(|| StorageError::Other(format!("could not open '{path}'")))?;
-    let size = handle.size();
-    handle.read_exact_at(0, size)
 }
 
-/// Opens a file for reading. Returns `None` if it cannot be opened.
-unsafe fn open_read(
-    file_system: duckdb_file_system,
-    path: &str,
-) -> Result<Option<Handle>, StorageError> {
-    let path_cstr = CString::new(path).map_err(|e| StorageError::Other(e.to_string()))?;
-    let opts = duckdb_create_file_open_options();
-    duckdb_file_open_options_set_flag(opts, duckdb_file_flag_DUCKDB_FILE_FLAG_READ, true);
-    let mut handle: duckdb_file_handle = std::ptr::null_mut();
-    let state = duckdb_file_system_open(file_system, path_cstr.as_ptr(), opts, &mut handle);
-    let mut opts_owned = opts;
-    duckdb_destroy_file_open_options(&mut opts_owned);
-    if state != DuckDBSuccess || handle.is_null() {
-        Ok(None)
-    } else {
-        Ok(Some(Handle(handle)))
+// SAFETY: as for `DuckDbStore`: DuckDB's FileSystem uses internal locking and
+// the raw pointer is not mutated after construction.
+unsafe impl Send for DuckDbOpener {}
+unsafe impl Sync for DuckDbOpener {}
+
+impl DuckDbOpener {
+    /// # Safety
+    /// `file_system` must be a live handle obtained from a DuckDB client
+    /// context. The opener takes ownership of it.
+    pub unsafe fn new(file_system: duckdb_file_system) -> Self {
+        Self { file_system }
+    }
+}
+
+impl Drop for DuckDbOpener {
+    fn drop(&mut self) {
+        if !self.file_system.is_null() {
+            unsafe { duckdb_destroy_file_system(&mut self.file_system) }
+        }
+    }
+}
+
+impl SourceOpener for DuckDbOpener {
+    fn open(&self, path: &str) -> Result<Option<Box<dyn SourceFile>>, StorageError> {
+        let path_cstr = CString::new(path).map_err(|e| StorageError::Other(e.to_string()))?;
+        let mut handle: duckdb_file_handle = std::ptr::null_mut();
+        let state = unsafe {
+            let mut opts = duckdb_create_file_open_options();
+            duckdb_file_open_options_set_flag(opts, duckdb_file_flag_DUCKDB_FILE_FLAG_READ, true);
+            let state =
+                duckdb_file_system_open(self.file_system, path_cstr.as_ptr(), opts, &mut handle);
+            duckdb_destroy_file_open_options(&mut opts);
+            state
+        };
+        if state != DuckDBSuccess || handle.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(Box::new(DuckDbFile(handle))))
+        }
     }
 }
 
 #[derive(Default)]
 struct HandlePool {
-    idle: HashMap<String, Vec<Handle>>,
+    idle: HashMap<String, Vec<Box<dyn SourceFile>>>,
     count: usize,
 }
 
 /// A read-only zarrs store that serves a kerchunk manifest.
 pub struct ManifestStore {
-    /// Pooled handles into referenced files. Declared before `file_system`
-    /// so they close before the filesystem is destroyed.
+    /// Pooled handles into referenced files. Declared before `opener` so
+    /// they close before the filesystem is destroyed.
     handles: Mutex<HandlePool>,
     entries: HashMap<StoreKey, ManifestEntry>,
-    file_system: duckdb_file_system,
-}
-
-// SAFETY: as for `DuckDbStore`: DuckDB's FileSystem uses internal locking and
-// the raw pointer is not mutated after construction. Handles are shared only
-// through the mutex-guarded pool.
-unsafe impl Send for ManifestStore {}
-unsafe impl Sync for ManifestStore {}
-
-impl Drop for ManifestStore {
-    fn drop(&mut self) {
-        // Close every pooled handle before the filesystem goes away.
-        if let Ok(mut pool) = self.handles.lock() {
-            pool.idle.clear();
-            pool.count = 0;
-        }
-        if !self.file_system.is_null() {
-            unsafe { duckdb_destroy_file_system(&mut self.file_system) }
-        }
-    }
+    opener: Box<dyn SourceOpener>,
 }
 
 impl ManifestStore {
@@ -582,41 +616,34 @@ impl ManifestStore {
         file_system: duckdb_file_system,
         manifest_path: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let doc = match read_whole_file(file_system, manifest_path) {
-            Ok(doc) => doc,
-            Err(err) => {
-                let mut fs = file_system;
-                duckdb_destroy_file_system(&mut fs);
-                return Err(
-                    format!("could not read kerchunk manifest '{manifest_path}': {err}").into(),
-                );
-            }
-        };
-        let entries = match parse_manifest(&doc) {
-            Ok(entries) => entries,
-            Err(err) => {
-                let mut fs = file_system;
-                duckdb_destroy_file_system(&mut fs);
-                return Err(format!("'{manifest_path}': {err}").into());
-            }
-        };
-        Ok(Self::from_entries(file_system, entries))
+        Self::open_with(Box::new(DuckDbOpener::new(file_system)), manifest_path)
     }
 
-    /// Build a store from already-parsed entries. `file_system` may be null
-    /// when every entry is inline (tests).
+    /// Read and parse the manifest at `manifest_path` through `opener`, which
+    /// then serves the referenced files too.
+    pub fn open_with(
+        opener: Box<dyn SourceOpener>,
+        manifest_path: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let doc = read_whole(opener.as_ref(), manifest_path)
+            .map_err(|err| format!("could not read kerchunk manifest '{manifest_path}': {err}"))?;
+        let entries = parse_manifest(&doc).map_err(|err| format!("'{manifest_path}': {err}"))?;
+        Ok(Self::from_entries(opener, entries))
+    }
+
+    /// Build a store from already-parsed entries.
     pub fn from_entries(
-        file_system: duckdb_file_system,
+        opener: Box<dyn SourceOpener>,
         entries: HashMap<StoreKey, ManifestEntry>,
     ) -> Self {
         Self {
             handles: Mutex::new(HandlePool::default()),
             entries,
-            file_system,
+            opener,
         }
     }
 
-    fn acquire(&self, path: &str) -> Result<Handle, StorageError> {
+    fn acquire(&self, path: &str) -> Result<Box<dyn SourceFile>, StorageError> {
         {
             let mut pool = self
                 .handles
@@ -627,16 +654,12 @@ impl ManifestStore {
                 return Ok(handle);
             }
         }
-        if self.file_system.is_null() {
-            return Err(StorageError::Other(format!(
-                "no DuckDB filesystem available to open referenced file '{path}'"
-            )));
-        }
-        unsafe { open_read(self.file_system, path)? }
+        self.opener
+            .open(path)?
             .ok_or_else(|| StorageError::Other(format!("could not open referenced file '{path}'")))
     }
 
-    fn release(&self, path: &str, handle: Handle) {
+    fn release(&self, path: &str, handle: Box<dyn SourceFile>) {
         if let Ok(mut pool) = self.handles.lock() {
             if pool.count < MAX_POOLED_HANDLES {
                 pool.idle.entry(path.to_string()).or_default().push(handle);
@@ -668,7 +691,7 @@ impl ManifestStore {
         length: Option<u64>,
         byte_ranges: ByteRangeIterator<'a>,
     ) -> Result<MaybeBytesIterator<'a>, StorageError> {
-        let handle = self.acquire(path)?;
+        let mut handle = self.acquire(path)?;
         let size = match length {
             Some(len) => len,
             None => handle.size().saturating_sub(offset),
@@ -677,7 +700,10 @@ impl ManifestStore {
         for byte_range in byte_ranges {
             let start = byte_range.start(size).min(size);
             let len = byte_range.length(size).min(size - start);
-            results.push(handle.read_exact_at(offset + start, len));
+            results.push(
+                read_exact_at(handle.as_mut(), offset + start, len)
+                    .map_err(|e| StorageError::Other(format!("referenced file '{path}': {e}"))),
+            );
         }
         self.release(path, handle);
         Ok(Some(Box::new(results.into_iter())))
@@ -716,7 +742,7 @@ impl ReadableStorageTraits for ManifestStore {
                 offset,
                 length: None,
             }) => {
-                let handle = self.acquire(path)?;
+                let mut handle = self.acquire(path)?;
                 let size = handle.size().saturating_sub(*offset);
                 self.release(path, handle);
                 Ok(Some(size))
@@ -735,13 +761,99 @@ mod tests {
 
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-memory stand-in for DuckDB's filesystem. `max_read` caps the bytes
+    /// returned per `read` call to imitate the HTTP filesystem's short reads;
+    /// `fail_seek` and `fail_read` force the FFI status codes the real handle
+    /// can return.
+    #[derive(Default)]
+    struct MemoryOpener {
+        files: HashMap<String, Vec<u8>>,
+        max_read: usize,
+        fail_seek: bool,
+        fail_read: bool,
+        opens: AtomicUsize,
+    }
+
+    impl MemoryOpener {
+        fn with_file(mut self, path: &str, data: &[u8]) -> Self {
+            self.files.insert(path.to_string(), data.to_vec());
+            self
+        }
+    }
+
+    struct MemoryFile {
+        data: Vec<u8>,
+        pos: usize,
+        max_read: usize,
+        fail_seek: bool,
+        fail_read: bool,
+    }
+
+    impl SourceFile for MemoryFile {
+        fn size(&mut self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn seek(&mut self, offset: u64) -> bool {
+            if self.fail_seek {
+                return false;
+            }
+            self.pos = offset as usize;
+            true
+        }
+
+        fn read(&mut self, buf: &mut [u8]) -> i64 {
+            if self.fail_read {
+                return -1;
+            }
+            let available = self.data.len().saturating_sub(self.pos);
+            let n = buf.len().min(available);
+            let n = if self.max_read > 0 {
+                n.min(self.max_read)
+            } else {
+                n
+            };
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            n as i64
+        }
+    }
+
+    impl SourceOpener for MemoryOpener {
+        fn open(&self, path: &str) -> Result<Option<Box<dyn SourceFile>>, StorageError> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(self.files.get(path).map(|data| {
+                Box::new(MemoryFile {
+                    data: data.clone(),
+                    pos: 0,
+                    max_read: self.max_read,
+                    fail_seek: self.fail_seek,
+                    fail_read: self.fail_read,
+                }) as Box<dyn SourceFile>
+            }))
+        }
+    }
+
+    fn opener_with(path: &str, data: &[u8]) -> MemoryOpener {
+        MemoryOpener::default().with_file(path, data)
+    }
+
+    fn err_text<T>(r: Result<T, StorageError>) -> String {
+        match r {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
     fn key(k: &str) -> StoreKey {
         StoreKey::new(k).unwrap()
     }
 
     fn store(doc: &str) -> ManifestStore {
         ManifestStore::from_entries(
-            std::ptr::null_mut(),
+            Box::new(MemoryOpener::default()),
             parse_manifest(doc.as_bytes()).unwrap(),
         )
     }
@@ -960,5 +1072,181 @@ mod tests {
         let s = store(r#"{"a/0": ["missing.nc", 0, 4]}"#);
         assert_eq!(s.size_key(&key("a/0")).unwrap(), Some(4));
         assert!(s.get(&key("a/0")).is_err());
+    }
+
+    // ── source file reads ────────────────────────────────────────────────
+
+    #[test]
+    fn read_exact_at_loops_over_short_reads() {
+        let opener = MemoryOpener {
+            max_read: 3,
+            ..opener_with("a.nc", &(0..20u8).collect::<Vec<_>>())
+        };
+        let mut file = opener.open("a.nc").unwrap().unwrap();
+        let got = read_exact_at(file.as_mut(), 2, 7).unwrap();
+        assert_eq!(got.as_ref(), &[2, 3, 4, 5, 6, 7, 8]);
+        let got = read_exact_at(file.as_mut(), 0, 0).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn read_past_end_of_file_names_offset_and_progress() {
+        let opener = opener_with("a.nc", &[0u8; 10]);
+        let mut file = opener.open("a.nc").unwrap().unwrap();
+        let msg = err_text(read_exact_at(file.as_mut(), 5, 8));
+        assert!(msg.contains("8 bytes at offset 5"), "{msg}");
+        assert!(msg.contains("after 5 bytes"), "{msg}");
+    }
+
+    #[test]
+    fn failed_seek_and_failed_read_are_errors_not_panics() {
+        let opener = MemoryOpener {
+            fail_seek: true,
+            ..opener_with("a.nc", &[0u8; 10])
+        };
+        let mut file = opener.open("a.nc").unwrap().unwrap();
+        assert!(err_text(read_exact_at(file.as_mut(), 3, 1)).contains("seek to offset 3"));
+
+        let opener = MemoryOpener {
+            fail_read: true,
+            ..opener_with("a.nc", &[0u8; 10])
+        };
+        let mut file = opener.open("a.nc").unwrap().unwrap();
+        assert!(err_text(read_exact_at(file.as_mut(), 0, 4))
+            .contains("read of 4 bytes at offset 0 failed"));
+    }
+
+    // ── range entries through the store ──────────────────────────────────
+
+    #[test]
+    fn range_entries_read_the_referenced_bytes_and_pool_the_handle() {
+        let data: Vec<u8> = (0..100u8).collect();
+        let opener = MemoryOpener {
+            max_read: 7,
+            ..opener_with("a.nc", &data)
+        };
+        let s = ManifestStore::from_entries(
+            Box::new(opener),
+            parse_manifest(
+                br#"{"v/0": ["a.nc", 10, 20], "v/1": ["a.nc", 30, 20], "w/0": ["a.nc"]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(s.get(&key("v/0")).unwrap().unwrap().as_ref(), &data[10..30]);
+        assert_eq!(s.get(&key("v/1")).unwrap().unwrap().as_ref(), &data[30..50]);
+        assert_eq!(s.size_key(&key("v/0")).unwrap(), Some(20));
+        // Whole-file references: size comes from the file, minus the offset.
+        assert_eq!(s.get(&key("w/0")).unwrap().unwrap().as_ref(), &data[..]);
+        assert_eq!(s.size_key(&key("w/0")).unwrap(), Some(100));
+
+        // Partial ranges are relative to the reference, clamped to its length.
+        let mut ranges = s
+            .get_partial_many(
+                &key("v/1"),
+                Box::new(
+                    [
+                        ByteRange::FromStart(5, Some(3)),
+                        ByteRange::Suffix(4),
+                        ByteRange::FromStart(15, Some(100)),
+                        ByteRange::FromStart(50, Some(1)),
+                    ]
+                    .into_iter(),
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranges.next().unwrap().unwrap().as_ref(), &data[35..38]);
+        assert_eq!(ranges.next().unwrap().unwrap().as_ref(), &data[46..50]);
+        assert_eq!(ranges.next().unwrap().unwrap().as_ref(), &data[45..50]);
+        assert_eq!(ranges.next().unwrap().unwrap().len(), 0);
+        assert!(ranges.next().is_none());
+
+        // Every read above went through one pooled handle.
+        let pool = s.handles.lock().unwrap();
+        assert_eq!(pool.count, 1);
+        assert_eq!(pool.idle["a.nc"].len(), 1);
+    }
+
+    #[test]
+    fn pool_holds_at_most_the_cap() {
+        let mut opener = MemoryOpener::default();
+        let mut refs = String::from("{");
+        for i in 0..(MAX_POOLED_HANDLES + 5) {
+            opener = opener.with_file(&format!("f{i}.nc"), &[1, 2, 3, 4]);
+            refs.push_str(&format!("\"a/{i}\": [\"f{i}.nc\", 0, 4],"));
+        }
+        refs.pop();
+        refs.push('}');
+        let s =
+            ManifestStore::from_entries(Box::new(opener), parse_manifest(refs.as_bytes()).unwrap());
+        for i in 0..(MAX_POOLED_HANDLES + 5) {
+            assert_eq!(s.get(&key(&format!("a/{i}"))).unwrap().unwrap().len(), 4);
+        }
+        assert_eq!(s.handles.lock().unwrap().count, MAX_POOLED_HANDLES);
+    }
+
+    #[test]
+    fn reference_beyond_end_of_file_is_an_error_naming_the_file() {
+        let s = ManifestStore::from_entries(
+            Box::new(opener_with("short.nc", &[0u8; 16])),
+            parse_manifest(br#"{"a/0": ["short.nc", 8, 16]}"#).unwrap(),
+        );
+        // The manifest says 16 bytes at 8; the file ends at 16.
+        let msg = err_text(s.get(&key("a/0")));
+        assert!(msg.contains("short.nc"), "{msg}");
+        assert!(msg.contains("hit end of file after 8 bytes"), "{msg}");
+        // size_key trusts the manifest; the read is what fails.
+        assert_eq!(s.size_key(&key("a/0")).unwrap(), Some(16));
+    }
+
+    #[test]
+    fn missing_referenced_file_names_the_path() {
+        let s = ManifestStore::from_entries(
+            Box::new(opener_with("present.nc", &[0u8; 4])),
+            parse_manifest(br#"{"a/0": ["absent.nc", 0, 4], "b/0": ["absent.nc"]}"#).unwrap(),
+        );
+        let msg = err_text(s.get(&key("a/0")));
+        assert_eq!(msg, "could not open referenced file 'absent.nc'");
+        // Whole-file references need the file even for size_key.
+        let msg = err_text(s.size_key(&key("b/0")));
+        assert!(msg.contains("absent.nc"), "{msg}");
+    }
+
+    // ── opening the manifest itself ──────────────────────────────────────
+
+    #[test]
+    fn open_with_reads_the_manifest_through_the_opener() {
+        let opener = MemoryOpener {
+            max_read: 5,
+            ..opener_with("refs.json", br#"{"a/0": ["data.bin", 1, 3], "a/1": "xyz"}"#)
+        }
+        .with_file("data.bin", b"0123456789");
+        let s = ManifestStore::open_with(Box::new(opener), "refs.json").unwrap();
+        assert_eq!(s.get(&key("a/0")).unwrap().unwrap().as_ref(), b"123");
+        assert_eq!(s.get(&key("a/1")).unwrap().unwrap().as_ref(), b"xyz");
+    }
+
+    #[test]
+    fn unopenable_or_invalid_manifest_errors_name_the_manifest() {
+        let msg = ManifestStore::open_with(Box::new(MemoryOpener::default()), "nope.json")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("could not read kerchunk manifest 'nope.json'"),
+            "{msg}"
+        );
+
+        let msg = ManifestStore::open_with(
+            Box::new(opener_with("bad.json", b"\x89HDF\r\n")),
+            "bad.json",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            msg.starts_with("'bad.json': kerchunk manifest is not JSON"),
+            "{msg}"
+        );
     }
 }
