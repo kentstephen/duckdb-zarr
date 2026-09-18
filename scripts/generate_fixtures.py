@@ -147,6 +147,20 @@ def write_manifest_over_zarr_v2(store: pathlib.Path, refs_path: pathlib.Path,
     refs_path.write_text(json.dumps({"version": 1, "refs": refs}))
 
 
+def virtualizarr_tools():
+    """Import VirtualiZarr lazily: only the kerchunk fixtures need it, and a
+    cached fixture tree must not require it to be installed."""
+    from virtualizarr import open_virtual_dataset
+    from virtualizarr.parsers import HDFParser
+    try:
+        from obspec_utils.registry import ObjectStoreRegistry
+    except ImportError:  # virtualizarr < 2.8
+        from virtualizarr.registry import ObjectStoreRegistry
+    from obstore.store import LocalStore
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    return open_virtual_dataset, HDFParser, registry
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     BIOIMAGE_FIXTURES.mkdir(parents=True, exist_ok=True)
@@ -694,15 +708,6 @@ def main() -> None:
     # can assert that read_zarr(manifest, format='kerchunk') and read_zarr(zarr)
     # return identical rows. Manifest paths are rewritten to be relative to the
     # repo root, which is where the SQL test runner resolves fixture paths.
-    from virtualizarr import open_virtual_dataset
-    from virtualizarr.parsers import HDFParser
-    try:
-        from obspec_utils.registry import ObjectStoreRegistry
-    except ImportError:  # virtualizarr < 2.8
-        from virtualizarr.registry import ObjectStoreRegistry
-    from obstore.store import LocalStore
-    registry = ObjectStoreRegistry({"file://": LocalStore()})
-
     print("kerchunk_netcdf4 (NetCDF4 + VirtualiZarr manifest + Zarr v2 twin)...")
     nc_path = FIXTURES / "kerchunk_netcdf4.nc"
     refs_path = FIXTURES / "kerchunk_netcdf4.json"
@@ -748,6 +753,7 @@ def main() -> None:
         }
         kc_ds.to_netcdf(nc_path, engine="h5netcdf", encoding=nc_enc)
 
+        open_virtual_dataset, HDFParser, registry = virtualizarr_tools()
         vds = open_virtual_dataset(f"file://{nc_path.resolve()}",
                                    parser=HDFParser(), registry=registry)
         vds.vz.to_kerchunk(str(refs_path), format="json")
@@ -835,8 +841,6 @@ def main() -> None:
     # `imagecodecs_zstd`, which the reader aliases to `zstd`). Each has a Zarr
     # v2 twin holding the same array.
     print("kerchunk_cog_deflate / kerchunk_cog_zstd (tiled TIFF + virtual-tiff manifest)...")
-    import tifffile
-    from virtual_tiff import VirtualTIFF
 
     rng = np.random.default_rng(3)
     cog_f32 = (rng.standard_normal((300, 500)) * 10 + 280).astype("float32")
@@ -867,6 +871,8 @@ def main() -> None:
                 stale.unlink()
         if twin_path.exists():
             _rmtree(twin_path)
+        import tifffile
+        from virtual_tiff import VirtualTIFF
         extratags = []
         if spec["nodata"] is not None:
             # GDAL_NODATA tag (42113): virtual-tiff turns it into the fill value.
@@ -877,6 +883,7 @@ def main() -> None:
             kwargs["planarconfig"] = spec["planar"]
         tifffile.imwrite(tif_path, spec["data"], **kwargs)
 
+        open_virtual_dataset, HDFParser, registry = virtualizarr_tools()
         vds = open_virtual_dataset(f"file://{tif_path.resolve()}",
                                    parser=VirtualTIFF(ifd=0), registry=registry)
         vds.vz.to_kerchunk(str(refs_path), format="json")
