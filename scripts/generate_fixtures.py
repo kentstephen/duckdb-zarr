@@ -808,29 +808,38 @@ def main() -> None:
     # Variants of kerchunk_zarr_v2.json whose `temperature/0.0.0` reference is
     # broken in a different way each. The SQL suite checks the reader reports
     # each with an error that names the file, not a panic or a silent fill.
-    # Cheap and derived, so they are rebuilt every run.
+    # Cached like every other fixture: CI generates fixtures inside the build
+    # container and runs the tests on the host, where the files may not be
+    # writable.
     print("kerchunk_errors (manifests with a broken chunk reference)...")
     errors_dir = FIXTURES / "kerchunk_errors"
-    errors_dir.mkdir(exist_ok=True)
-    base = json.loads(refs_path.read_text())
-    chunk_key = "temperature/0.0.0"
-    chunk_rel = base["refs"][chunk_key][0]
-    chunk_size = (ROOT / chunk_rel).stat().st_size
-    variants = {
-        # The referenced file does not exist.
-        "missing_file": [f"{errors_dir.relative_to(ROOT).as_posix()}/does_not_exist.bin"],
-        # The range runs past the end of the file.
-        "past_end": [chunk_rel, 0, chunk_size + 1000],
-        # The range stops short of the chunk: a truncated gzip stream.
-        "truncated": [chunk_rel, 0, 10],
-        # The offset lies beyond the end of the file.
-        "offset_beyond_end": [chunk_rel, chunk_size + 1, 4],
-    }
+    error_names = ("missing_file", "past_end", "truncated", "offset_beyond_end")
+    if all((errors_dir / f"{name}.json").exists() for name in error_names):
+        print(f"  (cached) {errors_dir}")
+        variants = {}
+    else:
+        errors_dir.mkdir(exist_ok=True)
+        base = json.loads(refs_path.read_text())
+        chunk_key = "temperature/0.0.0"
+        chunk_rel = base["refs"][chunk_key][0]
+        chunk_size = (ROOT / chunk_rel).stat().st_size
+        variants = {
+            # The referenced file does not exist.
+            "missing_file": [f"{errors_dir.relative_to(ROOT).as_posix()}/does_not_exist.bin"],
+            # The range runs past the end of the file.
+            "past_end": [chunk_rel, 0, chunk_size + 1000],
+            # The range stops short of the chunk: a truncated gzip stream.
+            "truncated": [chunk_rel, 0, 10],
+            # The offset lies beyond the end of the file.
+            "offset_beyond_end": [chunk_rel, chunk_size + 1, 4],
+        }
+        assert set(variants) == set(error_names)
     for name, ref in variants.items():
         doc = {"version": 1, "refs": dict(base["refs"])}
         doc["refs"][chunk_key] = ref
         (errors_dir / f"{name}.json").write_text(json.dumps(doc))
-    print(f"  wrote {errors_dir}")
+    if variants:
+        print(f"  wrote {errors_dir}")
 
     # ── kerchunk_cog_* ───────────────────────────────────────────────────────
     # Cloud-optimised GeoTIFFs indexed by virtual-tiff. Tiled TIFF tiles are
