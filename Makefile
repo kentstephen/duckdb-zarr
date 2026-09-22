@@ -49,33 +49,36 @@ test_release: generate_fixtures test_extension_release
 # test_http_real runs only the real-data file.
 test_http: test_http_debug
 test_http_debug: generate_fixtures
-	uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_http_integration.py test/test_http_integration_real.py \
 		--extension build/debug/$(EXTENSION_NAME).duckdb_extension -v
 test_http_release: generate_fixtures
-	uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_http_integration.py test/test_http_integration_real.py \
 		--extension build/release/$(EXTENSION_NAME).duckdb_extension -v
 test_http_real:
-	uv run --with pytest --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_http_integration_real.py \
 		--extension build/debug/$(EXTENSION_NAME).duckdb_extension -v
 
+# pytest and hypothesis come from the `dev` dependency group in pyproject.toml
+# (uv run installs it by default). Only the Python duckdb package is pinned on
+# the command line, to match TARGET_DUCKDB_VERSION.
 # Property-based tests for kerchunk manifests (test/test_kerchunk_property.py).
 # Hypothesis generates random datasets, VirtualiZarr indexes them, and the
 # extension must read the manifest exactly like the data. Build first.
 # HYPOTHESIS_PROFILE=ci|default|deep sets the example count; test_kerchunk_deep
 # is the long search for hunting bugs.
 test_kerchunk: generate_fixtures
-	uv run --with pytest --with hypothesis --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_kerchunk_property.py \
 		--extension build/release/$(EXTENSION_NAME).duckdb_extension -v
 test_kerchunk_debug: generate_fixtures
-	uv run --with pytest --with hypothesis --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_kerchunk_property.py \
 		--extension build/debug/$(EXTENSION_NAME).duckdb_extension -v
 test_kerchunk_deep: generate_fixtures
-	HYPOTHESIS_PROFILE=deep uv run --with pytest --with hypothesis --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
+	HYPOTHESIS_PROFILE=deep uv run --with 'duckdb==$(TARGET_DUCKDB_VERSION:v%=%)' \
 		pytest test/test_kerchunk_property.py \
 		--extension build/release/$(EXTENSION_NAME).duckdb_extension -v
 
