@@ -59,7 +59,9 @@ DuckDB's secrets manager (`CREATE SECRET ... TYPE S3`).
 A [kerchunk](https://fsspec.github.io/kerchunk/spec.html) JSON manifest describes a
 Zarr store whose chunks are byte ranges inside other files: NetCDF4/HDF5, GRIB,
 GeoTIFF, or another Zarr. Tools such as [VirtualiZarr](https://virtualizarr.readthedocs.io/)
-produce them without copying any data. Pass `format='kerchunk'` to read one:
+produce them without copying any data. JSON manifests are read; the Parquet form
+kerchunk writes for very large reference sets is not supported yet. Pass
+`format='kerchunk'` to read one:
 
 ```sql
 SELECT * FROM read_zarr('refs.json', format='kerchunk');
@@ -77,7 +79,7 @@ the codecs covered by the tests, and the current limitations.
 
 - **Table functions**: `read_zarr`, `read_zarr_metadata`, `read_zarr_groups`; replacement scan for local `.zarr` paths
 - **Zarr formats**: v2 and v3; consolidated metadata (`.zmetadata`, `consolidated_metadata`); kerchunk JSON manifests via `format='kerchunk'`
-- **Codecs**: Blosc, LZ4, zstd, gzip/zlib, shuffle, fletcher32
+- **Codecs**: Blosc, LZ4, zstd, gzip/zlib, shuffle, fletcher32, LZW (TIFF)
 - **Conventions**: CF fill values and `missing_value`, `scale_factor`/`add_offset`, CF time to `TIMESTAMP` (`decode_times=`), bounds variables, auxiliary coordinates
 - **Storage**: local filesystem, HTTP/HTTPS, S3, GCS and Azure through DuckDB's filesystem and secrets manager
 - **Selection**: `dims=` and `array_path=`, recursive array discovery, projection pushdown

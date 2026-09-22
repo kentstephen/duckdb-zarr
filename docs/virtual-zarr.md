@@ -14,11 +14,59 @@ SELECT * FROM read_zarr_metadata('refs.json', format='kerchunk');
 SELECT * FROM read_zarr_groups('refs.json', format='kerchunk');
 ```
 
+## How a manifest is written
+
+A manifest is a JSON document mapping Zarr store keys to either a metadata document
+or a `[path, offset, length]` byte range in some other file. Any tool can write one;
+these are the two producers the test suite uses. VirtualiZarr indexes a NetCDF4 file:
+
+```python
+from virtualizarr import open_virtual_dataset
+from virtualizarr.parsers import HDFParser
+from obspec_utils.registry import ObjectStoreRegistry
+from obstore.store import LocalStore
+
+registry = ObjectStoreRegistry({"file://": LocalStore()})
+vds = open_virtual_dataset("file:///data/sst.nc", parser=HDFParser(), registry=registry)
+vds.vz.to_kerchunk("sst.json", format="json")
+```
+
+and virtual-tiff indexes a TIFF (`VirtualTIFF(ifd=0)` in place of `HDFParser()`).
+The result for a two-variable NetCDF4 looks like this, trimmed:
+
+```json
+{
+  "version": 1,
+  "refs": {
+    ".zgroup": "{\"zarr_format\": 2}",
+    "sst/.zarray": "{\"shape\": [365, 720, 1440], \"chunks\": [1, 720, 1440], \"dtype\": \"<f4\", \"filters\": [{\"id\": \"shuffle\", \"elementsize\": 4}], \"compressor\": {\"id\": \"zlib\", \"level\": 4}, ...}",
+    "sst/.zattrs": "{\"_ARRAY_DIMENSIONS\": [\"time\", \"lat\", \"lon\"], \"units\": \"degC\"}",
+    "sst/0.0.0": ["/data/sst.nc", 8192, 1048576],
+    "sst/1.0.0": ["/data/sst.nc", 1056768, 1048576],
+    "time/.zarray": "{\"shape\": [365], \"chunks\": [365], \"dtype\": \"<i4\", ...}",
+    "time/0": "base64:AAAAAAEAAAACAAAA..."
+  }
+}
+```
+
+Every chunk key is a byte range of the source file (`sst/0.0.0` is the first 1 MiB
+of `sst.nc` after an 8 KiB header), small arrays are inlined as base64, and the
+`.zarray` documents carry the source file's own filter pipeline (here HDF5 shuffle
+and deflate) as Zarr v2 codec ids. The reader needs a codec for each id it meets;
+see [Codecs](#codecs).
+
+Paths may be local, `file://`, `s3://`, `gs://`, `az://` or `https://`. A manifest
+written on one machine works on another as long as the paths still resolve, which
+is why manifests over object storage usually carry absolute URLs.
+
 ## How a manifest is read
 
-The manifest and every file it references are read through DuckDB's filesystem, so
-local paths, HTTP(S), S3, GCS and Azure all work and the secrets manager applies.
-Relative paths in the manifest resolve against DuckDB's working directory.
+The manifest and every file it references are opened through DuckDB's filesystem,
+so a manifest can live anywhere DuckDB can read and can point anywhere DuckDB can
+read: local paths, HTTP(S), S3, GCS and Azure, with the secrets manager applying to
+each file as it is opened. Nothing in the reader is local-only; a local manifest may
+reference `https://` files and vice versa. Relative paths in the manifest resolve
+against DuckDB's working directory.
 
 Metadata documents (`.zgroup`, `.zarray`, `.zattrs`) and inline chunks (plain text or
 `base64:`-prefixed) are served from memory. A `.zmetadata` document is synthesised
@@ -56,8 +104,17 @@ exercised by the test suite:
 | VirtualiZarr `HDFParser` | NetCDF4 / HDF5, contiguous dataset | none | Reads as one whole-range reference. |
 | virtual-tiff | Tiled GeoTIFF, Deflate | `imagecodecs_deflate` | Reads. The id is aliased to `zlib`. |
 | virtual-tiff | Tiled GeoTIFF, ZSTD | `imagecodecs_zstd` | Reads. The id is aliased to `zstd`. |
-| virtual-tiff | GeoTIFF with a predictor, LZW, JPEG, WebP | not available in zarrs | Not supported. |
+| virtual-tiff | Stripped TIFF (one chunk per strip), LZW | `imagecodecs_lzw` | Reads. LZW is decoded by the extension's own codec (`lzw_codec.rs`, on the `weezl` crate): TIFF 6.0 LZW, MSB-first with the early code-width change. |
+| virtual-tiff | TIFF with a horizontal or floating-point predictor, JPEG, WebP, PackBits | not available in zarrs | Not supported. |
 | VirtualiZarr `HDFParser` | HDF5 scale-offset filter | rejected by the producer | Cannot be indexed today. |
+
+Stripped TIFFs need no special handling: virtual-tiff makes each strip a chunk of
+`[RowsPerStrip, width]`, so a whole-image strip (common in microscopy exports) is
+one chunk and a plate with 8 strips is 8 chunks. Partial trailing strips are still
+open on the producer side ([virtual-tiff#24](https://github.com/virtual-zarr/virtual-tiff/issues/24)).
+virtual-tiff also fails on TIFFs that omit the `SamplesPerPixel` tag, which some
+microscope software does ([async-tiff#318](https://github.com/developmentseed/async-tiff/issues/318));
+a manifest built by hand from `tifffile`'s strip offsets reads fine.
 
 Checksums are skipped for manifest reads because zarrs' `fletcher32` implementation
 drops the trailing byte of odd-length payloads
@@ -83,4 +140,5 @@ Fixtures under `test/fixtures/xarray_tutorial/`, all built by
 | `kerchunk_netcdf4.json` (+ `.nc`, `_v2.zarr`) | HDF5 pipeline with shuffle, deflate and fletcher32; deflate only; a contiguous dataset; `_FillValue` masking; inline base64 coordinates. |
 | `kerchunk_zarr_v2.json` (+ `_source.zarr`) | Hand-built manifest with whole-file `[path]` references over Zarr v2 chunk files, one chunk deliberately missing. |
 | `kerchunk_cog_deflate.json`, `kerchunk_cog_zstd.json` (+ `.tif`, `_v2.zarr`) | virtual-tiff over tiled GeoTIFFs: Deflate float32 with a nodata tag, and 3-band int8 ZSTD with the `imagecodecs_zstd` id. |
+| `kerchunk_tiff_lzw_strips.json` (+ `.tif`, `_v2.zarr`) | virtual-tiff over a stripped uint16 LZW image in the shape of a microscopy plate TIFF (Cell Painting style): one chunk per strip, `imagecodecs_lzw`. |
 | `kerchunk_errors/` | Manifests that reference a missing file, a range past the end of a file, and a truncated chunk, for the error-path tests. |

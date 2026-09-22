@@ -841,20 +841,27 @@ def main() -> None:
     if variants:
         print(f"  wrote {errors_dir}")
 
-    # ── kerchunk_cog_* ───────────────────────────────────────────────────────
-    # Cloud-optimised GeoTIFFs indexed by virtual-tiff. Tiled TIFF tiles are
-    # Zarr chunks by construction: each tile is one [path, offset, length]
-    # reference. Two variants: a single-band float32 Deflate image with a
-    # nodata value (virtual-tiff writes numcodecs `zlib`), and a 3-band int8
-    # ZSTD image stored band-interleaved (virtual-tiff writes
-    # `imagecodecs_zstd`, which the reader aliases to `zstd`). Each has a Zarr
-    # v2 twin holding the same array.
-    print("kerchunk_cog_deflate / kerchunk_cog_zstd (tiled TIFF + virtual-tiff manifest)...")
+    # ── kerchunk_cog_* / kerchunk_tiff_* ─────────────────────────────────────
+    # TIFFs indexed by virtual-tiff. TIFF tiles and strips are Zarr chunks by
+    # construction: each is one [path, offset, length] reference. Three
+    # variants: a single-band float32 Deflate COG with a nodata value
+    # (virtual-tiff writes numcodecs `zlib`); a 3-band int8 ZSTD COG stored
+    # band-interleaved (virtual-tiff writes `imagecodecs_zstd`, which the
+    # reader aliases to `zstd`); and a stripped uint16 LZW image in the shape
+    # of a microscopy plate TIFF (virtual-tiff writes `imagecodecs_lzw`, the
+    # reader's own LZW codec). Each has a Zarr v2 twin holding the same array.
+    print("kerchunk_cog_deflate / kerchunk_cog_zstd / kerchunk_tiff_lzw_strips "
+          "(TIFF + virtual-tiff manifest)...")
 
     rng = np.random.default_rng(3)
     cog_f32 = (rng.standard_normal((300, 500)) * 10 + 280).astype("float32")
     cog_f32[10:20, :] = -9999.0
     cog_i8 = rng.integers(-100, 100, (3, 200, 400), dtype="int8")
+    yy, xx = np.mgrid[0:270, 0:360]
+    cells_u16 = rng.integers(250, 400, (270, 360)).astype("float64")
+    for cy, cx, amp in rng.uniform([0, 0, 2000], [270, 360, 30000], (25, 3)):
+        cells_u16 += amp * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 7.0 ** 2))
+    cells_u16 = np.clip(cells_u16, 0, 65535).astype("uint16")
     cogs = {
         "kerchunk_cog_deflate": dict(
             data=cog_f32, dims=("y", "x"), tile=(256, 256), compression="deflate",
@@ -866,6 +873,14 @@ def main() -> None:
             data=cog_i8, dims=("band", "y", "x"), tile=(128, 128), compression="zstd",
             planar="separate", nodata=None,
             v2_enc={"compressor": {"id": "gzip", "level": 1}, "chunks": (1, 128, 128)},
+        ),
+        # Bioimaging TIFFs (e.g. the Cell Painting Gallery plates) are stripped,
+        # not tiled: uint16 minisblack, LZW, one strip per RowsPerStrip rows.
+        # Smooth blobs on a noisy background compress the way microscopy does.
+        "kerchunk_tiff_lzw_strips": dict(
+            data=cells_u16, dims=("y", "x"), rowsperstrip=45, compression="lzw",
+            planar=None, nodata=None,
+            v2_enc={"compressor": {"id": "gzip", "level": 1}, "chunks": (45, 360)},
         ),
     }
     for name, spec in cogs.items():
@@ -886,8 +901,11 @@ def main() -> None:
         if spec["nodata"] is not None:
             # GDAL_NODATA tag (42113): virtual-tiff turns it into the fill value.
             extratags.append((42113, "s", 0, spec["nodata"], True))
-        kwargs = dict(tile=spec["tile"], compression=spec["compression"], metadata=None,
-                      extratags=extratags)
+        kwargs = dict(compression=spec["compression"], metadata=None, extratags=extratags)
+        if "tile" in spec:
+            kwargs["tile"] = spec["tile"]
+        else:
+            kwargs["rowsperstrip"] = spec["rowsperstrip"]
         if spec["planar"]:
             kwargs["planarconfig"] = spec["planar"]
         tifffile.imwrite(tif_path, spec["data"], **kwargs)

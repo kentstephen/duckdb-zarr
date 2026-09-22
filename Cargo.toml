@@ -46,6 +46,9 @@ base64 = "0.22"
 # HTTP stores go through DuckDbStore (duckdb-wasm's own httpfs) instead.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 zarrs_http = "0.3.1"
+weezl = "0.2"
+inventory = "0.3"
+
 # Already in the tree transitively via duckdb -> arrow -> arrow-arith, so taking
 # it directly costs nothing new; feature unification pulls in std/alloc from
 # that transitive edge regardless of default-features here. Used for calendar
